@@ -48,22 +48,36 @@
 - загрузка стартовых площадок (содержит количество подготовок и пусков на каждую площадку за период, а также занятость по времени) в виде таблицы.
 
 # **UseCase-диаграмма**
-![Диаграмма use-case](image/use-case.drawio.png)
+<p align="center">
+  <img src="image/use-case.drawio.png" alt="Диаграмма use-case">
+</p>
 
 # **Контекстная диаграмма в нотации IDEF0**
-![Диаграмма в нотации IDEF0](image/IDEF0_contextual.drawio.png)
+<p align="center">
+  <img src="image/IDEF0_contextual.drawio.png" alt="Диаграмма в нотации IDEF0">
+</p>
 
 # **Диаграмма декомпозиции**
-![Диаграмма декомпозиции](image/IDEF0_decomposition.drawio.png)
+<p align="center">
+  <img src="image/IDEF0_decomposition.drawio.png" alt="Диаграмма декомпозиции">
+</p>
 
 # **Диаграмма последовательности (Обработка нештатной ситуации)**
-![Диаграмма последовательности](image/Диаграмма_последовательности_(Обработка_нештатной_ситуации).png)
+<p align="center">
+  <img src="image/Диаграмма_последовательности_(Обработка_нештатной_ситуации).png" alt="Диаграмма последовательности">
+</p>
 
 # **Диаграмма последовательности (Списание топлива на пуск)**
-![Диаграмма последовательности](image/Диаграмма_последовательности_(Списание_топлива_на_пуск).png)
+<p align="center">
+  <img src="image/Диаграмма_последовательности_(Списание_топлива_на_пуск).png" alt="Диаграмма последовательности">
+</p>
 
 # **Диаграмма потоков данных DFD**
-![Диаграмма DFD](image/DFD.png)
+<p align="center">
+  <img src="image/DFD.png" alt="Диаграмма DFD">
+</p>
 
 # **IDEF1X**
-![IDEF1X](image/IDEF1X.png)
+<p align="center">
+  <img src="image/IDEF1X.png" alt="IDEF1X">
+</p>
