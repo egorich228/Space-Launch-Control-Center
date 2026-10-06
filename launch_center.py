@@ -1,5 +1,5 @@
 """Центр управления космическими пусками — desktop-приложение (Python 3, tkinter + SQLite)."""
-import sqlite3, hashlib, csv, tkinter as tk
+import sqlite3, hashlib, csv, random, tkinter as tk
 from tkinter import ttk, messagebox as mb, filedialog
 from datetime import datetime, timedelta
 
@@ -18,9 +18,11 @@ def pd_(s):
 
 STAGES = ["Доставка и сборка на техническом комплексе", "Транспортировка на стартовый комплекс",
           "Заправка компонентами топлива", "Предстартовый контроль систем"]
+STAGE_ICON = ["🚚", "🔧", "⛽", "🛰"]           # значок для каждого из 4 этапов подготовки, в том же порядке, что и STAGES
+COL = {"ok": "#1e7b3a", "cur": "#1f5fa8", "wait": "#c9d0da", "bad": "#b3261e", "warn": "#b26a00"}  # цвет узла схемы по состоянию
 NEXT = {"запланирован": "подготовка", "подготовка": "готов", "готов": "выполнен", "перенесен": "запланирован"}
-PERM = {"Руководитель": {"postpone", "pad", "report"}, "Диспетчер": {"launch", "stage", "incident"},
-        "Техник по топливу": {"fuel"}, "Аналитик": {"report"}}
+PERM = {"Руководитель": {"postpone", "pad", "report", "weather"}, "Диспетчер": {"launch", "stage", "incident", "weather"},
+        "Техник по топливу": {"fuel"}, "Аналитик": {"report"}, "Инспектор безопасности": {"report"}}
 ROLE = [""]
 
 db.executescript("""
@@ -37,17 +39,63 @@ CREATE TABLE IF NOT EXISTS usage(id INTEGER PRIMARY KEY, batch_id INT REFERENCES
 CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, launch_id INT REFERENCES launches, channel TEXT, time TEXT, descr TEXT, measures TEXT, status TEXT);
 CREATE TABLE IF NOT EXISTS postponements(id INTEGER PRIMARY KEY, launch_id INT REFERENCES launches, reason TEXT, new_date TEXT, dt TEXT);
 CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, role TEXT, txt TEXT, dt TEXT, seen INT DEFAULT 0);
+CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY, fio TEXT, role TEXT, action TEXT, dt TEXT);
+CREATE TABLE IF NOT EXISTS weather_checks(id INTEGER PRIMARY KEY, launch_id INT REFERENCES launches, source TEXT,
+  checked_at TEXT, wind REAL, temp REAL, storm INT, exceeded INT, details TEXT);
 """)
 if not q("SELECT 1 FROM users"):
     for fio, lg, role in [("Иванов И.И.", "admin", "Руководитель"), ("Петров П.П.", "disp", "Диспетчер"),
-                          ("Сидоров С.С.", "fuel", "Техник по топливу"), ("Орлова О.О.", "an", "Аналитик")]:
+                          ("Сидоров С.С.", "fuel", "Техник по топливу"), ("Орлова О.О.", "an", "Аналитик"),
+                          ("Кузнецов К.К.", "insp", "Инспектор безопасности")]:
         q("INSERT INTO users(fio,login,pwd,role) VALUES(?,?,?,?)", (fio, lg, hashlib.sha256(lg.encode()).hexdigest(), role))
     for t in ["Союз-2.1а", "Ангара-А5", "Протон-М"]: q("INSERT INTO rockets(type,specs) VALUES(?,'')", (t,))
     for t, m, o in [("Спутник связи", 3200, "ГСО"), ("Метеоспутник", 1500, "ССО"), ("Грузовой корабль", 7000, "НОО")]:
         q("INSERT INTO payloads(type,mass,orbit) VALUES(?,?,?)", (t, m, o))
     for n in ["Площадка 31", "Площадка 1С", "Площадка 81"]: q("INSERT INTO pads(name) VALUES(?)", (n,))
 
-RUK, DSP, FUEL, AN = "Руководитель", "Диспетчер", "Техник по топливу", "Аналитик"
+RUK, DSP, FUEL, AN, INSP = "Руководитель", "Диспетчер", "Техник по топливу", "Аналитик", "Инспектор безопасности"
+
+# ---------- Метеорологическая служба космодрома ----------
+# Предельные значения (в реальной системе — нормативный документ; здесь заданы константами).
+WIND_LIMIT = 15.0          # предельная скорость ветра на высоте, м/с
+TEMP_MIN, TEMP_MAX = -30.0, 45.0  # допустимый диапазон температуры, °C
+
+def weather_exceeded(wind, temp, storm):
+    """Единый критерий превышения предельных значений — одинаковый и для автоматического запроса,
+    и для ручного ввода метеорологом: сравнение с одними и теми же порогами, источник данных на
+    сам критерий не влияет (см. пояснение в чате: это решение принято явно, так как в задании
+    критерий для ручного ввода не был определён)."""
+    reasons = []
+    if wind > WIND_LIMIT: reasons.append(f"ветер {wind:g} м/с превышает предел {WIND_LIMIT:g} м/с")
+    if not (TEMP_MIN <= temp <= TEMP_MAX): reasons.append(f"температура {temp:g}°C вне диапазона [{TEMP_MIN:g}; {TEMP_MAX:g}]°C")
+    if storm: reasons.append("зафиксирована грозовая активность")
+    return bool(reasons), reasons
+
+def fetch_external_weather(launch_id):
+    """
+    Запрос прогноза погоды по высотам к внешней метеорологической службе космодрома.
+    Точка интеграции с реальным API — здесь имитируется HTTP-запрос и его возможная недоступность
+    (сеть, таймаут, служба не отвечает), чтобы показать оба сценария из задания:
+      - служба доступна  -> возвращает (ветер, температура, признак грозы);
+      - служба недоступна -> возвращает None, и далее требуется ручной ввод метеорологом.
+    """
+    try:
+        if random.random() < 0.25:  # ~25% случаев — служба недоступна (для демонстрации сценария)
+            return None
+        return (round(random.uniform(2, 22), 1), round(random.uniform(-25, 35), 1), random.random() < 0.15)
+    except Exception:
+        return None
+
+def record_weather(launch_id, wind, temp, storm, source):
+    """Сохраняет результат метеопроверки (source: 'авто' | 'ручной') и, при превышении
+    предельных значений, формирует предупреждение о возможном переносе пуска."""
+    exceeded, reasons = weather_exceeded(wind, temp, storm)
+    q("INSERT INTO weather_checks(launch_id,source,checked_at,wind,temp,storm,exceeded,details) VALUES(?,?,?,?,?,?,?,?)",
+      (launch_id, source, now(), wind, temp, int(storm), int(exceeded), "; ".join(reasons)))
+    if exceeded:
+        notify((RUK, DSP), f"Пуск {ln(launch_id)}: метеослужба ({source}) сообщает превышение предельных значений — "
+                            f"{', '.join(reasons)}. Рекомендуется рассмотреть перенос пуска («Перенести»).")
+    return exceeded, reasons
 def notify(roles, txt):
     for r in ([roles] if isinstance(roles, str) else roles):
         q("INSERT INTO notes(role,txt,dt,seen) VALUES(?,?,?,0)", (r, txt, now()))
@@ -155,6 +203,73 @@ class Grid(ttk.Frame):
 def sid(g): return (g.sel() or [0])[0]
 def err(m): mb.showerror("Ошибка", m)
 
+class Diagram(tk.Canvas):
+    """
+    Наглядная схема пуска: узлы «Регистрация → 4 этапа подготовки → Пуск», соединённые стрелками.
+    Цвет и значок узла меняются автоматически по данным из БД:
+      серый  = ожидает, синий = текущий шаг, зелёный = выполнен, оранжевый = перенесен, красный = отменен.
+    Если по пуску есть открытая нештатная ситуация, текущий узел подменяется значком ⚠
+    и мигает красным/оранжевым (тикает раз в 600 мс). Клик по схеме показывает описание инцидента.
+    """
+    R = 28  # радиус кружка-узла в пикселях
+
+    def __init__(s, p):
+        super().__init__(p, height=170, bg="white", highlightthickness=1, highlightbackground="#d9e1ec")
+        s.launch_id, s.blink = None, False
+        s.bind("<Button-1>", s.click)
+        s.tick()
+
+    def show(s, launch_id):
+        s.launch_id = launch_id; s.draw()
+
+    def tick(s):
+        # раз в 600 мс переключаем фазу мигания и перерисовываем, если схема кому-то показана
+        if not s.winfo_exists(): return
+        s.blink = not s.blink
+        if s.launch_id: s.draw()
+        s.after(600, s.tick)
+
+    def click(s, e):
+        if not s.launch_id: return
+        i = q("SELECT descr,measures,status FROM incidents WHERE launch_id=? AND status!='закрыта' ORDER BY id DESC LIMIT 1", (s.launch_id,))
+        if i: mb.showwarning("Нештатная ситуация", f"{i[0][0]}\n\nПринятые меры: {i[0][1] or '—'}\nСтатус: {i[0][2]}")
+
+    def draw(s):
+        s.delete("all")
+        if not s.launch_id:
+            s.create_text(16, 82, anchor="w", fill="#9aa5b1", font=("Segoe UI", 10),
+                           text="Выберите пуск в таблице выше — здесь появится схема этапов"); return
+        row = q("SELECT status FROM launches WHERE id=?", (s.launch_id,))
+        if not row: s.launch_id = None; return
+        lstatus = row[0][0]
+        stage_rows = q("SELECT status FROM stages WHERE launch_id=? ORDER BY id", (s.launch_id,))
+        has_incident = bool(q("SELECT 1 FROM incidents WHERE launch_id=? AND status!='закрыта'", (s.launch_id,)))
+
+        # собираем узлы: регистрация -> 4 этапа -> сам пуск
+        nodes = [("📝", "Регистрация", "ok")]
+        cur_assigned = lstatus != "подготовка"  # текущий этап помечаем только пока идёт подготовка
+        for i in range(4):
+            st = stage_rows[i][0] if i < len(stage_rows) else None
+            if st == "выполнен": kind = "ok"
+            elif not cur_assigned: kind = "cur"; cur_assigned = True
+            else: kind = "wait"
+            nodes.append((STAGE_ICON[i], f"Этап {i+1}", kind))
+        nodes.append(("🔥", "Пуск", {"выполнен": "ok", "отменен": "bad", "перенесен": "warn", "готов": "cur"}.get(lstatus, "wait")))
+
+        if has_incident:  # подменяем текущий узел на мигающий значок нештатной ситуации
+            for j, (ic, lb, kind) in enumerate(nodes):
+                if kind == "cur": nodes[j] = ("⚠", lb, "bad" if s.blink else "warn"); break
+
+        x, y, gap = 60, 55, 155
+        for j, (ic, lb, kind) in enumerate(nodes):
+            cx = x + j * gap
+            if j: s.create_line(x + (j - 1) * gap + s.R, y, cx - s.R, y, fill="#b7c0cc", width=2, arrow="last")
+            s.create_oval(cx - s.R, y - s.R, cx + s.R, y + s.R, fill=COL[kind], outline="")
+            s.create_text(cx, y, text=ic, font=("Segoe UI", 18))
+            s.create_text(cx, y + s.R + 16, text=lb, font=("Segoe UI", 10), fill="#4a5a6d")
+        if has_incident: s.create_text(x, y + s.R + 34, anchor="w", fill="#b3261e",
+                                        font=("Segoe UI", 9), text="⚠ Есть нештатная ситуация — нажмите на схему для подробностей")
+
 def pad_ok(pad, start, skip=0):
     t = pt(start)
     if not t: return "Время старта: формат ГГГГ-ММ-ДД ЧЧ:ММ"
@@ -173,22 +288,68 @@ REP = {
   "(SELECT COUNT(*) FROM launches l WHERE l.pad_id=p.id AND l.status='выполнен' AND date(l.start_time) BETWEEN :a AND :b),"
   "(SELECT COALESCE(SUM(MAX(0,julianday(MIN(m.d2,:b))-julianday(MAX(m.d1,:a))+1)),0) FROM maintenance m WHERE m.pad_id=p.id) FROM pads p"),
 }
+REPORTS_FOR = {INSP: ["Нештатные ситуации"]}  # инспектору доступны только отчёты по инцидентам; остальным ролям — весь список REP
 
 def build(role, fio):
     ROLE[0] = role; root.title(f"Центр управления пусками — {fio} ({role})")
     QUEUE.clear(); SHOW[0] = False
+
+    def audit(action):
+        # Все действия инспектора безопасности фиксируются в отдельном аудиторском журнале
+        if role == INSP: q("INSERT INTO audit_log(fio,role,action,dt) VALUES(?,?,?,?)", (fio, role, action, now()))
+    audit("Вход в систему")
+
     st = ttk.Label(root, anchor="w", style="Status.TLabel"); st.pack(side="bottom", fill="x")
     def logout():
+        audit("Выход из системы")
         for w in root.winfo_children(): w.destroy()
         root.title("Центр управления пусками"); login()
     ttk.Button(st, text="Сменить пользователя", command=logout).pack(side="right")
     def tick():
         if st.winfo_exists(): st.config(text=f"Пользователь: {fio}   |   Роль: {role}   |   {now()}   |   Серые кнопки недоступны вашей роли"); root.after(30000, tick)
     tick()
-    nb = ttk.Notebook(root); nb.pack(fill="both", expand=True); G = []
-    def page(n): f = ttk.Frame(nb, padding=12); nb.add(f, text=n); return f
+
+    # Ограничение видимости вкладок: инспектор безопасности видит только журналы нештатных
+    # ситуаций и переносов (плюс уведомления и отчёты по инцидентам) — без доступа к расписанию
+    # пусков и подготовке; журнал аудита видит только руководитель.
+    def tab_ok(n):
+        if role == INSP: return n in ("Нештатные ситуации", "Переносы пусков", "🔔 Уведомления", "Отчёты")
+        if n == "🛡 Аудит": return role == RUK
+        return True
+
+    nb = ttk.Notebook(root); nb.pack(fill="both", expand=True); G, DGS = [], []
+    def page(n):
+        f = ttk.Frame(nb, padding=12); nb.add(f, text=n)
+        if not tab_ok(n): nb.hide(f)
+        return f
     def grid(p, *a): g = Grid(p, *a); g.pack(fill="both", expand=True, pady=(0, 10)); G.append(g); return g
-    def R(): [g.load() for g in G]
+    def R():
+        for g in G: g.load()
+        for d in DGS: d.draw()
+
+    def on_tab_changed(e):
+        name = nb.tab(nb.select(), "text")
+        if role == INSP and name in ("Нештатные ситуации", "Переносы пусков", "Отчёты"): audit(f"Просмотр вкладки «{name}»")
+    nb.bind("<<NotebookTabChanged>>", on_tab_changed)
+
+    def weather_poll():
+        # Фоновая проверка: за 24 часа (окно 23–25 ч) до старта запрашиваем прогноз у внешней
+        # метеослужбы; если служба недоступна — просим диспетчера/руководителя ввести данные вручную.
+        if not st.winfo_exists(): return
+        lo, hi = datetime.now() + timedelta(hours=23), datetime.now() + timedelta(hours=25)
+        for lid, start in q("SELECT id,start_time FROM launches WHERE status IN ('запланирован','подготовка','готов')"):
+            t = pt(start)
+            if t and lo <= t <= hi and not q("SELECT 1 FROM weather_checks WHERE launch_id=?", (lid,)):
+                data = fetch_external_weather(lid)
+                if data: record_weather(lid, *data, "авто")
+                else:
+                    q("INSERT INTO weather_checks(launch_id,source,checked_at,wind,temp,storm,exceeded,details) "
+                      "VALUES(?,?,?,NULL,NULL,NULL,NULL,'внешняя служба недоступна')", (lid, "недоступна", now()))
+                    notify((RUK, DSP), f"Пуск {ln(lid)}: внешняя метеослужба недоступна. Требуется ручной ввод "
+                                       f"метеоданных метеорологом (вкладка «Пуски» → «Метеоданные»).")
+        root.after(60000, weather_poll)
+    weather_poll()
+
     def bar(p, items):
         f = ttk.Frame(p); f.pack(side="bottom", fill="x", pady=(4, 6), before=p.pack_slaves()[0])
         ttk.Separator(f).pack(fill="x", pady=(0, 6))
@@ -202,7 +363,13 @@ def build(role, fio):
              "SELECT l.id,r.type,pl.type,l.orbit,pd.name,l.start_time,l.status FROM launches l JOIN rockets r ON r.id=l.rocket_id "
              "JOIN payloads pl ON pl.id=l.payload_id JOIN pads pd ON pd.id=l.pad_id ORDER BY l.start_time")
     S = grid(p, ("№", "Этап подготовки", "Статус", "Дата"), "SELECT id,name,status,COALESCE(dt,'') FROM stages WHERE launch_id=?", lambda: (sid(L),))
-    L.t.bind("<<TreeviewSelect>>", lambda e: S.load())
+    dg = Diagram(p); dg.pack(fill="x", pady=(0, 10)); DGS.append(dg)
+    W = grid(p, ("№", "Источник", "Время", "Ветер, м/с", "Темп., °C", "Гроза", "Превышение"),
+             "SELECT id,source,checked_at,COALESCE(wind,''),COALESCE(temp,''),"
+             "CASE storm WHEN 1 THEN 'да' WHEN 0 THEN 'нет' ELSE '—' END,"
+             "CASE exceeded WHEN 1 THEN 'да' WHEN 0 THEN 'нет' ELSE '—' END "
+             "FROM weather_checks WHERE launch_id=? ORDER BY id DESC", lambda: (sid(L),))
+    L.t.bind("<<TreeviewSelect>>", lambda e: (S.load(), W.load(), dg.show(sid(L))))
 
     def add_launch():
         f = form("Новый пуск", [("r", "Ракета-носитель", pairs("SELECT id,type FROM rockets"), ""),
@@ -258,8 +425,21 @@ def build(role, fio):
         q("UPDATE launches SET start_time=?,status='перенесен' WHERE id=?", (f["d"], r[0]))
         q("INSERT INTO postponements(launch_id,reason,new_date,dt) VALUES(?,?,?,?)", (r[0], f["w"], f["d"], now()))
         notify((DSP, FUEL), f"Пуск {ln(r[0])} перенесён (причина: {f['w']}). Далее: диспетчер — верните пуск в план («Следующий статус»); техник — проверьте срок годности партий на новую дату."); R()
+    def add_weather():
+        r = L.sel()
+        if not r: return
+        if r[6] in ("выполнен", "отменен"): return err("Метеоданные вводятся только для активных пусков")
+        f = form("Метеоданные (ручной ввод метеорологом)", [
+            ("w", "Скорость ветра на высоте, м/с", None, ""), ("t", "Температура, °C", None, ""),
+            ("s", "Грозовая активность", [("0", "Нет"), ("1", "Да")], "")])
+        if not f: return
+        try: wind, temp, storm = float(f["w"]), float(f["t"]), bool(int(f["s"]))
+        except Exception: return err("Укажите числовые значения ветра и температуры, отметьте грозовую активность")
+        exceeded, reasons = record_weather(r[0], wind, temp, storm, "ручной")
+        mb.showinfo("Метеоданные внесены", "Превышений предельных значений не обнаружено." if not exceeded
+                    else "Превышение предельных значений:\n" + "\n".join(reasons)); R()
     bar(p, [("Создать пуск", "launch", add_launch), ("Следующий статус", "launch", advance), ("Завершить этап", "stage", stage),
-            ("Перенести", "postpone", postpone), ("Отменить пуск", "launch", cancel)])
+            ("Перенести", "postpone", postpone), ("Отменить пуск", "launch", cancel), ("Метеоданные", "weather", add_weather)])
 
     # ---------- Топливо ----------
     p = page("Топливо")
@@ -329,6 +509,15 @@ def build(role, fio):
         R()
     bar(p, [("Зафиксировать", "incident", add_inc), ("Следующий статус", "incident", inc_next)])
 
+    # ---------- Переносы пусков (журнал) ----------
+    p = page("Переносы пусков")
+    grid(p, ("№", "Пуск", "Причина", "Новая дата", "Оформлен"),
+         "SELECT id,launch_id,reason,new_date,dt FROM postponements ORDER BY id DESC")
+
+    # ---------- Аудит (только для руководителя) ----------
+    p = page("🛡 Аудит")
+    grid(p, ("№", "Время", "Сотрудник", "Роль", "Действие"), "SELECT id,dt,fio,role,action FROM audit_log ORDER BY id DESC LIMIT 300")
+
     # ---------- Уведомления ----------
     p = page("🔔 Уведомления")
     N = grid(p, ("№", "Время", "Уведомление"), "SELECT id,dt,txt FROM notes WHERE role=? ORDER BY id DESC LIMIT 100", (role,))
@@ -342,8 +531,9 @@ def build(role, fio):
 
     # ---------- Отчёты ----------
     if "report" in PERM[role]:
+        keys = REPORTS_FOR.get(role, list(REP))  # инспектору безопасности доступны только отчёты по инцидентам
         p = page("Отчёты"); top = ttk.Frame(p); top.pack(fill="x", pady=4)
-        cb = ttk.Combobox(top, values=list(REP), state="readonly", width=26); cb.current(0); cb.pack(side="left", padx=3)
+        cb = ttk.Combobox(top, values=keys, state="readonly", width=26); cb.current(0); cb.pack(side="left", padx=3)
         a, b = MaskEntry(top, "dddd-dd-dd", width=11), MaskEntry(top, "dddd-dd-dd", width=11); a.insert(0, "2026-01-01"); b.insert(0, "2026-12-31")
         for t, w in (("с", a), ("по", b)): ttk.Label(top, text=t).pack(side="left", padx=(8, 2)); w.pack(side="left", padx=3)
         tv = ttk.Treeview(p, show="headings"); tv.pack(fill="both", expand=True)
@@ -353,6 +543,7 @@ def build(role, fio):
             for c in cols: tv.heading(c, text=c); tv.column(c, width=150)
             tv.delete(*tv.get_children()); rows = db.execute(sql, {"a": a.get(), "b": b.get()}).fetchall()
             for r in rows: tv.insert("", "end", values=r)
+            audit(f"Сформирован отчёт «{cb.get()}» за период {a.get()}–{b.get()}")
             return cols, rows
         def export():
             cols, rows = show()
@@ -360,6 +551,7 @@ def build(role, fio):
             if fn:
                 with open(fn, "w", newline="", encoding="utf-8-sig") as fh:
                     w = csv.writer(fh, delimiter=";"); w.writerow(cols); w.writerows(rows)
+                audit(f"Экспорт отчёта «{cb.get()}» в CSV")
         ttk.Button(top, text="Сформировать", command=show).pack(side="left", padx=3)
         ttk.Button(top, text="Экспорт CSV", command=export).pack(side="left", padx=3)
 
